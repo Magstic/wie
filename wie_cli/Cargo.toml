@@ -12,6 +12,7 @@ anyhow = { workspace = true, features = ["backtrace"] }
 clap = { workspace = true }
 directories = { version = "^6.0" }
 fast_image_resize = "6.0.0"
+gilrs = { version = "^0.11" }
 rodio = { version = "^0.22", features = ["playback"] }
 midir = { version = "^0.11" }
 softbuffer = { version = "^0.4" }

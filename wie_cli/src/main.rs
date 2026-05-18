@@ -1,13 +1,15 @@
 extern crate alloc;
 
 mod audio_sink;
+mod config;
 mod database;
 mod filesystem;
+mod gamepad;
 mod window;
 
 use core::str;
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::HashMap,
     error::Error,
     fs::{self, File},
     io::{LineWriter, Write, stderr},
@@ -22,6 +24,7 @@ use std::{
 };
 
 use clap::Parser;
+use gilrs::GamepadId;
 use midir::MidiOutput;
 use rodio::{DeviceSinkBuilder, Player, buffer::SamplesBuffer, conversions::SampleTypeConverter};
 use winit::keyboard::{KeyCode as WinitKeyCode, PhysicalKey};
@@ -34,8 +37,10 @@ use wie_skt::SktEmulator;
 
 use self::{
     audio_sink::AudioSink,
+    config::{Config, GamepadInput},
     database::DatabaseRepository,
     filesystem::CliFilesystem,
+    gamepad::{GamepadCallbackEvent, GamepadState},
     window::{WindowCallbackEvent, WindowHandle, WindowImpl},
 };
 
@@ -43,11 +48,12 @@ struct WieCliPlatform {
     audio_thread_tx: Sender<(u8, u32, Vec<i16>)>,
     database_repository: DatabaseRepository,
     filesystem: CliFilesystem,
+    vibrate_tx: Sender<(u64, u8)>,
     window: WindowHandle,
 }
 
 impl WieCliPlatform {
-    fn new(window: WindowHandle) -> Self {
+    fn new(window: WindowHandle, vibrate_tx: Sender<(u64, u8)>) -> Self {
         let (tx, rx) = channel();
         thread::spawn(|| Self::audio_thread(rx));
 
@@ -55,6 +61,7 @@ impl WieCliPlatform {
             audio_thread_tx: tx,
             database_repository: DatabaseRepository::new(),
             filesystem: CliFilesystem::new(),
+            vibrate_tx,
             window,
         }
     }
@@ -147,7 +154,75 @@ impl Platform for WieCliPlatform {
     }
 
     fn vibrate(&self, duration_ms: u64, intensity: u8) {
-        tracing::info!("vibrate({duration_ms}ms, {intensity}%) - not supported on this platform");
+        if let Err(err) = self.vibrate_tx.send((duration_ms, intensity)) {
+            tracing::debug!("Failed to queue gamepad vibration: {err}");
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum InputSource {
+    Keyboard(WinitKeyCode),
+    Gamepad { id: GamepadId, input: GamepadInput },
+}
+
+#[derive(Default)]
+struct InputState {
+    repeat_times: HashMap<KeyCode, SystemTime>,
+    sources: HashMap<InputSource, KeyCode>,
+    pressed_counts: HashMap<KeyCode, usize>,
+}
+
+impl InputState {
+    fn press(&mut self, source: InputSource, keycode: KeyCode) -> bool {
+        if self.sources.contains_key(&source) {
+            return false;
+        }
+
+        self.sources.insert(source, keycode);
+
+        let count = self.pressed_counts.entry(keycode).or_default();
+        let send_keydown = *count == 0;
+        *count += 1;
+
+        if send_keydown {
+            self.repeat_times.insert(keycode, SystemTime::now());
+        }
+
+        send_keydown
+    }
+
+    fn release(&mut self, source: InputSource) -> Option<KeyCode> {
+        let keycode = self.sources.remove(&source)?;
+        let count = self.pressed_counts.get_mut(&keycode)?;
+
+        if *count > 1 {
+            *count -= 1;
+            return None;
+        }
+
+        self.pressed_counts.remove(&keycode);
+        self.repeat_times.remove(&keycode);
+
+        Some(keycode)
+    }
+
+    fn repeat_due(&mut self, now: SystemTime) -> Vec<KeyCode> {
+        let mut repeated = Vec::new();
+
+        for (keycode, last_repeat) in &mut self.repeat_times {
+            let should_repeat = now
+                .duration_since(*last_repeat)
+                .map(|duration| duration.as_millis() > 100)
+                .unwrap_or(false);
+
+            if should_repeat {
+                repeated.push(*keycode);
+                *last_repeat = now;
+            }
+        }
+
+        repeated
     }
 }
 
@@ -191,8 +266,20 @@ fn profile_callback(path: &PathBuf) -> anyhow::Result<wie_backend::ProfileCallba
 }
 
 pub fn start(filename: &str, options: Options) -> anyhow::Result<()> {
+    let config_path = config_path()?;
+    let config = Config::load(&config_path)?;
+    let keyboard_map = config.keyboard_map().clone();
+    let gamepad_map = config.gamepad_map().clone();
+    let (vibrate_tx, vibrate_rx) = channel();
+    let mut gamepad = match GamepadState::new(vibrate_rx) {
+        Ok(gamepad) => Some(gamepad),
+        Err(err) => {
+            tracing::warn!("Failed to initialize gamepad support: {err}");
+            None
+        }
+    };
     let window = WindowImpl::new(240, 320).unwrap(); // TODO hardcoded size
-    let platform = Box::new(WieCliPlatform::new(window.handle()));
+    let platform = Box::new(WieCliPlatform::new(window.handle(), vibrate_tx));
 
     let buf = fs::read(filename)?;
     let mut emulator: Box<dyn Emulator> = if filename.ends_with("zip") {
@@ -247,42 +334,36 @@ pub fn start(filename: &str, options: Options) -> anyhow::Result<()> {
         anyhow::bail!("Unknown file format");
     };
 
-    let mut key_events = HashMap::new();
+    let mut input_state = InputState::default();
     window.run(move |event| {
         match event {
             WindowCallbackEvent::Update => {
                 let now = SystemTime::now();
 
-                for entry in key_events.iter_mut() {
-                    let (keycode, time) = entry;
-
-                    // TODO const
-                    if now.duration_since(*time).unwrap().as_millis() > 100 {
-                        emulator.handle_event(Event::Keyrepeat(*keycode));
-                        *time = now;
+                if let Some(gamepad) = gamepad.as_mut() {
+                    for gamepad_event in gamepad.poll() {
+                        handle_gamepad_event(&mut *emulator, &gamepad_map, &mut input_state, gamepad_event);
                     }
+                }
+
+                for keycode in input_state.repeat_due(now) {
+                    emulator.handle_event(Event::Keyrepeat(keycode));
                 }
 
                 emulator.tick()?
             }
             WindowCallbackEvent::Redraw => emulator.handle_event(Event::Redraw),
             WindowCallbackEvent::Keydown(x) => {
-                if let Some(keycode) = convert_key(x) {
-                    let entry = key_events.entry(keycode);
-                    if let Entry::Vacant(entry) = entry {
-                        emulator.handle_event(Event::Keydown(keycode));
-
-                        let now = SystemTime::now();
-
-                        entry.insert(now);
-                    }
+                if let Some((source, keycode)) = convert_keyboard_input(x, &keyboard_map)
+                    && input_state.press(source, keycode)
+                {
+                    emulator.handle_event(Event::Keydown(keycode));
                 }
             }
             WindowCallbackEvent::Keyup(x) => {
-                if let Some(keycode) = convert_key(x)
-                    && key_events.contains_key(&keycode)
+                if let PhysicalKey::Code(code) = x
+                    && let Some(keycode) = input_state.release(InputSource::Keyboard(code))
                 {
-                    key_events.remove(&keycode);
                     emulator.handle_event(Event::Keyup(keycode));
                 }
             }
@@ -292,32 +373,45 @@ pub fn start(filename: &str, options: Options) -> anyhow::Result<()> {
     })
 }
 
-fn convert_key(key: PhysicalKey) -> Option<KeyCode> {
-    match key {
-        PhysicalKey::Code(WinitKeyCode::Digit1) => Some(KeyCode::NUM1),
-        PhysicalKey::Code(WinitKeyCode::Digit2) => Some(KeyCode::NUM2),
-        PhysicalKey::Code(WinitKeyCode::Digit3) => Some(KeyCode::NUM3),
-        PhysicalKey::Code(WinitKeyCode::KeyQ) => Some(KeyCode::NUM4),
-        PhysicalKey::Code(WinitKeyCode::KeyW) => Some(KeyCode::NUM5),
-        PhysicalKey::Code(WinitKeyCode::KeyE) => Some(KeyCode::NUM6),
-        PhysicalKey::Code(WinitKeyCode::KeyA) => Some(KeyCode::NUM7),
-        PhysicalKey::Code(WinitKeyCode::KeyS) => Some(KeyCode::NUM8),
-        PhysicalKey::Code(WinitKeyCode::KeyD) => Some(KeyCode::NUM9),
-        PhysicalKey::Code(WinitKeyCode::KeyZ) => Some(KeyCode::STAR),
-        PhysicalKey::Code(WinitKeyCode::KeyX) => Some(KeyCode::NUM0),
-        PhysicalKey::Code(WinitKeyCode::KeyC) => Some(KeyCode::HASH),
-        PhysicalKey::Code(WinitKeyCode::Space) => Some(KeyCode::OK),
-        PhysicalKey::Code(WinitKeyCode::ArrowUp) => Some(KeyCode::UP),
-        PhysicalKey::Code(WinitKeyCode::ArrowDown) => Some(KeyCode::DOWN),
-        PhysicalKey::Code(WinitKeyCode::ArrowLeft) => Some(KeyCode::LEFT),
-        PhysicalKey::Code(WinitKeyCode::ArrowRight) => Some(KeyCode::RIGHT),
-        PhysicalKey::Code(WinitKeyCode::Backspace) => Some(KeyCode::CLEAR),
-        PhysicalKey::Code(WinitKeyCode::ShiftLeft) => Some(KeyCode::LEFT_SOFT_KEY),
-        PhysicalKey::Code(WinitKeyCode::ShiftRight) => Some(KeyCode::RIGHT_SOFT_KEY),
-        PhysicalKey::Code(WinitKeyCode::Backquote) => Some(KeyCode::VOLUME_UP),
-        PhysicalKey::Code(WinitKeyCode::Tab) => Some(KeyCode::VOLUME_DOWN),
-        PhysicalKey::Code(WinitKeyCode::F1) => Some(KeyCode::CALL),
-        PhysicalKey::Code(WinitKeyCode::F2) => Some(KeyCode::HANGUP),
-        _ => None,
+fn config_path() -> anyhow::Result<PathBuf> {
+    let exe_path = std::env::current_exe()?;
+    let parent = exe_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Failed to determine executable directory"))?;
+
+    Ok(parent.join("config.cfg"))
+}
+
+fn convert_keyboard_input(key: PhysicalKey, keyboard_map: &HashMap<WinitKeyCode, KeyCode>) -> Option<(InputSource, KeyCode)> {
+    let PhysicalKey::Code(code) = key else {
+        return None;
+    };
+
+    keyboard_map.get(&code).copied().map(|keycode| (InputSource::Keyboard(code), keycode))
+}
+
+fn handle_gamepad_event(
+    emulator: &mut dyn Emulator,
+    gamepad_map: &HashMap<GamepadInput, KeyCode>,
+    input_state: &mut InputState,
+    event: GamepadCallbackEvent,
+) {
+    match event {
+        GamepadCallbackEvent::Keydown { id, input } => {
+            let Some(keycode) = gamepad_map.get(&input).copied() else {
+                return;
+            };
+
+            let source = InputSource::Gamepad { id, input };
+            if input_state.press(source, keycode) {
+                emulator.handle_event(Event::Keydown(keycode));
+            }
+        }
+        GamepadCallbackEvent::Keyup { id, input } => {
+            let source = InputSource::Gamepad { id, input };
+            if let Some(keycode) = input_state.release(source) {
+                emulator.handle_event(Event::Keyup(keycode));
+            }
+        }
     }
 }
