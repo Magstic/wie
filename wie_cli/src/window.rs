@@ -10,7 +10,7 @@ use winit::{
     dpi::{LogicalSize, PhysicalSize},
     event::{ElementState, KeyEvent, StartCause, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
-    keyboard::PhysicalKey,
+    keyboard::{KeyCode, PhysicalKey},
     window::{Window as WinitWindow, WindowId},
 };
 
@@ -99,11 +99,9 @@ impl WindowImpl {
     {
         self.event_loop.set_control_flow(ControlFlow::Poll);
 
-        const DEFAULT_USER_SCALE_FACTOR: f64 = 1.0;
         let orig_size = LogicalSize::new(self.width, self.height);
         let mut handler = ApplicationHandlerImpl {
-            native_scale_factor: 1.0,
-            user_scale_factor: DEFAULT_USER_SCALE_FACTOR,
+            window_scale: 1,
             content_size: orig_size,
             scaled_size: orig_size.to_physical(1.0),
             window_size: Default::default(),
@@ -123,6 +121,8 @@ impl WindowImpl {
 enum Scaler {
     /// 1:1 native scaling.
     Native,
+    /// Nearest-neighbor integer scaling.
+    Nearest { scale: u32 },
     /// hq2x, hq3x, hq4x scaling.
     Hqx { scale: i8 },
     /// Lanczos3 scaling
@@ -133,6 +133,7 @@ impl fmt::Display for Scaler {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Scaler::Native => f.write_str("Native")?,
+            Scaler::Nearest { scale } => f.write_fmt(format_args!("Nearest({scale}x)"))?,
             Scaler::Hqx { scale } => f.write_fmt(format_args!("Hq{scale}x"))?,
             Scaler::Lanczos3 { scale, resizer: _ } => f.write_fmt(format_args!("Lanczos3({scale})"))?,
         }
@@ -140,14 +141,36 @@ impl fmt::Display for Scaler {
     }
 }
 
+fn scale_nearest_integer(dst: &mut [u32], src: &[u32], src_w: u32, src_h: u32, scale: u32) {
+    let src_w = src_w as usize;
+    let src_h = src_h as usize;
+    let scale = scale as usize;
+    let dst_w = src_w * scale;
+
+    for y in 0..src_h {
+        for sy in 0..scale {
+            let dst_row = (y * scale + sy) * dst_w;
+            let src_row = y * src_w;
+
+            for x in 0..src_w {
+                let px = src[src_row + x];
+                let dst_x = x * scale;
+
+                for sx in 0..scale {
+                    dst[dst_row + dst_x + sx] = px;
+                }
+            }
+        }
+    }
+}
+
 impl Scaler {
-    fn new(scale: f64) -> Scaler {
+    fn new(scale: u32) -> Scaler {
+        let scale = scale.max(1);
+
         match scale {
-            _ if (scale - 1.0).abs() < 1e-3 => Scaler::Native,
-            _ => Scaler::Lanczos3 {
-                scale,
-                resizer: fast_image_resize::Resizer::new(),
-            },
+            1 => Scaler::Native,
+            _ => Scaler::Nearest { scale },
         }
     }
 
@@ -161,9 +184,21 @@ impl Scaler {
         }
     }
 
+    #[allow(dead_code)]
+    fn new_smooth(scale: f64) -> Scaler {
+        match scale {
+            _ if (scale - 1.0).abs() < 1e-3 => Scaler::Native,
+            _ => Scaler::Lanczos3 {
+                scale,
+                resizer: fast_image_resize::Resizer::new(),
+            },
+        }
+    }
+
     fn scale(&self) -> f64 {
         match self {
             Scaler::Native => 1.0,
+            Scaler::Nearest { scale } => *scale as f64,
             Scaler::Hqx { scale } => *scale as f64,
             Scaler::Lanczos3 { scale, resizer: _ } => *scale,
         }
@@ -172,6 +207,7 @@ impl Scaler {
     fn to_physical(&self, logical_size: LogicalSize<u32>) -> PhysicalSize<u32> {
         match self {
             Scaler::Native => PhysicalSize::new(logical_size.width, logical_size.height),
+            Scaler::Nearest { scale } => PhysicalSize::new(logical_size.width * *scale, logical_size.height * *scale),
             Scaler::Hqx { scale } => PhysicalSize::new(logical_size.width * *scale as u32, logical_size.height * *scale as u32),
             Scaler::Lanczos3 { scale, resizer: _ } => PhysicalSize::new(
                 (logical_size.width as f64 * *scale).floor() as u32,
@@ -183,10 +219,16 @@ impl Scaler {
     fn scale_image(&mut self, dst: &mut Vec<u32>, src: &Vec<u32>, dst_size: PhysicalSize<u32>, src_size: LogicalSize<u32>) {
         match self {
             Scaler::Native => dst.copy_from_slice(src),
+
+            Scaler::Nearest { scale } => {
+                scale_nearest_integer(dst.as_mut_slice(), src.as_slice(), src_size.width, src_size.height, *scale);
+            }
+
             Scaler::Hqx { scale } if *scale == 2 => hqx::hq2x(src.as_slice(), dst.as_mut_slice(), src_size.width as usize, src_size.height as usize),
             Scaler::Hqx { scale } if *scale == 3 => hqx::hq3x(src.as_slice(), dst.as_mut_slice(), src_size.width as usize, src_size.height as usize),
             Scaler::Hqx { scale } if *scale == 4 => hqx::hq4x(src.as_slice(), dst.as_mut_slice(), src_size.width as usize, src_size.height as usize),
             Scaler::Hqx { scale } => panic!("invalid hqx scale factor {scale}"),
+
             Scaler::Lanczos3 { scale: _, resizer } => {
                 let (_, srcarr, _) = unsafe { src.align_to::<u8>() };
                 let srcimg = fast_image_resize::images::ImageRef::new(src_size.width, src_size.height, srcarr, PixelType::U8x4).unwrap();
@@ -215,12 +257,8 @@ pub struct ApplicationHandlerImpl<C>
 where
     C: FnMut(WindowCallbackEvent) -> wie_util::Result<()> + 'static,
 {
-    /// Native scale factor of the emulator window.
-    native_scale_factor: f64,
-    /// User specified scale factor.
-    user_scale_factor: f64,
+    window_scale: u32,
     /// Scaler config.
-    /// Actual scaling factor = native_scale_factor + user_scale_factor
     scaler: Scaler,
     /// Temporary buffer for scaler.
     scaled_image_buf: Vec<u32>,
@@ -254,34 +292,27 @@ where
         }
     }
 
-    /// Sets the native/user scale factor.
-    /// After calling this you'll need to call [`Self::on_resize`] to update the surface accordingly.
-    fn update_scale_factor(&mut self, native: Option<f64>, user: Option<f64>) {
-        if let Some(f) = native {
-            self.native_scale_factor = f
-        }
-        if let Some(f) = user {
-            self.user_scale_factor = f
-        }
-        if self.native_scale_factor + self.user_scale_factor < 0.1 {
-            tracing::info!(
-                "scale factor too small(native {} + user {}), resetting user_scale_factor",
-                self.native_scale_factor,
-                self.user_scale_factor
-            );
-            self.user_scale_factor = 0.0;
-        }
-
-        self.scaler = Scaler::new(self.native_scale_factor + self.user_scale_factor);
+    fn update_scale_factor(&mut self, scale: u32) {
+        self.window_scale = scale.max(1);
+        self.scaler = Scaler::new(self.window_scale);
         self.scaled_size = self.scaler.to_physical(self.content_size);
         self.scaled_image_buf = vec![0u32; self.scaled_size.width as usize * self.scaled_size.height as usize];
+    }
+
+    fn set_window_scale(&mut self, scale: u32) {
+        self.update_scale_factor(scale);
+        if let Some(window) = self.window.as_ref()
+            && let Some(new_size) = window.request_inner_size(self.scaled_size)
+        {
+            self.window_size = new_size;
+        }
+        self.on_resize();
     }
 
     /// Updates the scaled content image surface's size.
     fn on_resize(&mut self) {
         tracing::info!(
-            "on_resize scale=(native {}, actual {}), content={:?}, scaled={:?}, window={:?}",
-            self.native_scale_factor,
+            "on_resize scale={}, content={:?}, scaled={:?}, window={:?}",
             self.scaler.scale(),
             self.content_size,
             self.scaled_size,
@@ -295,9 +326,9 @@ where
             Some(surface) => {
                 let desired_len = self.scaled_size.width * self.scaled_size.height;
                 if surface.buffer_mut().unwrap().len() == desired_len as usize {
-                    // nothing to do
+                    self.paint_last_frame();
                     return;
-                };
+                }
                 surface
             }
         };
@@ -360,11 +391,7 @@ where
         self.context = Some(context);
         self.window_size = window.inner_size();
 
-        // After the window is initialized we resize the window again with the correct scale factor.
-        self.update_scale_factor(Some(window.scale_factor()), Some(1.0));
-        if let Some(new_size) = window.request_inner_size(self.scaled_size) {
-            self.window_size = new_size;
-        }
+        self.update_scale_factor(1);
         self.on_resize();
     }
 
@@ -395,36 +422,41 @@ where
                         ..
                     },
                 ..
-            } => match state {
-                ElementState::Pressed => {
-                    self.callback(WindowCallbackEvent::Keydown(physical_key), event_loop);
+            } => {
+                if let ElementState::Pressed = state
+                    && let PhysicalKey::Code(code) = physical_key
+                {
+                    match code {
+                        KeyCode::Equal | KeyCode::NumpadAdd => {
+                            self.set_window_scale(self.window_scale + 1);
+                            return;
+                        }
+                        KeyCode::Minus | KeyCode::NumpadSubtract => {
+                            self.set_window_scale(self.window_scale.saturating_sub(1));
+                            return;
+                        }
+                        _ => {}
+                    }
                 }
-                ElementState::Released => {
-                    self.callback(WindowCallbackEvent::Keyup(physical_key), event_loop);
+
+                match state {
+                    ElementState::Pressed => {
+                        self.callback(WindowCallbackEvent::Keydown(physical_key), event_loop);
+                    }
+                    ElementState::Released => {
+                        self.callback(WindowCallbackEvent::Keyup(physical_key), event_loop);
+                    }
                 }
-            },
+            }
             WindowEvent::RedrawRequested => {
                 self.callback(WindowCallbackEvent::Redraw, event_loop);
             }
             WindowEvent::Resized(new_size) => {
                 tracing::debug!("WindowResized {new_size:?}");
                 self.window_size = new_size;
-                if self.window_size != self.scaled_size {
-                    // Determine the new scale factor.
-                    let wscale = self.window_size.width as f64 / self.content_size.width as f64;
-                    let hscale = self.window_size.height as f64 / self.content_size.height as f64;
-                    let new_scale = wscale.min(hscale);
-                    let new_user_scale = new_scale - self.native_scale_factor;
-                    self.update_scale_factor(None, Some(new_user_scale));
-                }
                 self.on_resize();
             }
-            WindowEvent::ScaleFactorChanged {
-                scale_factor,
-                mut inner_size_writer,
-            } => {
-                tracing::info!("ScaleFactorChanged {scale_factor}");
-                self.update_scale_factor(Some(scale_factor), None);
+            WindowEvent::ScaleFactorChanged { mut inner_size_writer, .. } => {
                 let _ = inner_size_writer.request_inner_size(self.scaled_size);
                 // Will receive WindowEvent::Resized soon, so no need to call self.on_resize().
             }
